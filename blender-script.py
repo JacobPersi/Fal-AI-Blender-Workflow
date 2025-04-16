@@ -303,21 +303,21 @@ class FAL_PT_Panel(bpy.types.Panel):
             else:
                 # Show install button if not in progress
                 box.operator("fal.install_package", text="Install FAL Package")
-            
-            # Display installation log if available
-            if hasattr(scene, "fal_install_log") and scene.fal_install_log:
-                log_box = layout.box()
-                log_box.label(text="Installation Log:", icon='TEXT')
-                
-                if hasattr(scene, "fal_install_success"):
-                    icon = 'CHECKMARK' if scene.fal_install_success else 'ERROR'
-                    status = "Success" if scene.fal_install_success else "Failed"
-                    log_box.label(text=f"Status: {status}", icon=icon)
-                
-                # Show log in a scrollable text box
-                row = log_box.row()
-                row.operator("fal.view_log", text="View Full Log")
-                row.operator("fal.view_debug_log", text="View Debug Log")
+        
+        # Always show log buttons in a new box, regardless of installation status
+        log_box = layout.box()
+        log_box.label(text="Logs:", icon='TEXT')
+        
+        # Installation status display (if available)
+        if hasattr(scene, "fal_install_success") and (hasattr(scene, "fal_install_log") and scene.fal_install_log):
+            icon = 'CHECKMARK' if scene.fal_install_success else 'ERROR'
+            status = "Success" if scene.fal_install_success else "Failed"
+            log_box.label(text=f"Last installation: {status}", icon=icon)
+        
+        # Always show log buttons
+        row = log_box.row()
+        row.operator("fal.view_log", text="View Full Log")
+        row.operator("fal.view_debug_log", text="View Debug Log")
         
         # FAL API Key management
         layout.separator()
@@ -373,7 +373,14 @@ class FAL_OT_ViewLog(bpy.types.Operator):
         
         # Create a text datablock to show the log
         log_text = bpy.data.texts.new("FAL_Installation_Log.txt")
-        log_text.write(context.scene.fal_install_log)
+        
+        # Handle the case when no installation has occurred yet
+        if hasattr(context.scene, "fal_install_log") and context.scene.fal_install_log:
+            log_content = context.scene.fal_install_log
+        else:
+            log_content = "No installation log available yet. Install the FAL package first."
+        
+        log_text.write(log_content)
         
         # Open a text editor area and show the log
         self._show_text_in_editor(log_text)
@@ -421,7 +428,14 @@ class FAL_OT_ViewDebugLog(bpy.types.Operator):
         
         # Create a text datablock to show the debug log
         log_text = bpy.data.texts.new("FAL_Debug_Log.txt")
-        log_text.write(context.scene.fal_debug_log)
+        
+        # Handle the case when debug log is not available
+        if hasattr(context.scene, "fal_debug_log") and context.scene.fal_debug_log:
+            log_content = context.scene.fal_debug_log
+        else:
+            log_content = "No debug log available."
+        
+        log_text.write(log_content)
         
         # Open a text editor area and show the log
         for window in bpy.context.window_manager.windows:
