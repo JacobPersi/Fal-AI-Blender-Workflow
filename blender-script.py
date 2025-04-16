@@ -16,6 +16,11 @@ import threading
 import site
 import tempfile
 import time
+import json
+import requests
+import fal.apps
+from pathlib import Path
+import bpy.utils.previews
 
 
 # Setup logging
@@ -475,6 +480,201 @@ class FAL_OT_UpdateAPIKey(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# Add after FALAddonPreferences class:
+
+class FALImageGenPreferences(bpy.types.PropertyGroup):
+    save_directory: bpy.props.StringProperty(
+        name="Save Directory",
+        description="Directory to save generated images",
+        default="",
+        subtype='DIR_PATH'
+    )
+    
+    prompt: bpy.props.StringProperty(
+        name="Prompt",
+        description="Text prompt for image generation",
+        default=""
+    )
+    
+    negative_prompt: bpy.props.StringProperty(
+        name="Negative Prompt",
+        description="Negative prompt for image generation",
+        default=""
+    )
+    
+    image_width: bpy.props.IntProperty(
+        name="Width",
+        description="Generated image width",
+        default=1024,
+        min=512,
+        max=2048
+    )
+    
+    image_height: bpy.props.IntProperty(
+        name="Height", 
+        description="Generated image height",
+        default=1024,
+        min=512,
+        max=2048
+    )
+    
+    num_inference_steps: bpy.props.IntProperty(
+        name="Steps",
+        description="Number of inference steps",
+        default=28,
+        min=1,
+        max=100
+    )
+    
+    enable_safety_checker: bpy.props.BoolProperty(
+        name="Enable Safety Checker",
+        description="Enable safety checker for generated images",
+        default=True
+    )
+
+class FAL_PT_ImageGenPanel(bpy.types.Panel):
+    """FAL Image Generation Panel"""
+    bl_label = "FAL Image Generation"
+    bl_idname = "FAL_PT_imagegen_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'FAL'
+    
+    def draw(self, context):
+        layout = self.layout
+        prefs = context.scene.fal_image_prefs
+        
+        # Save directory
+        layout.prop(prefs, "save_directory")
+        
+        # Image settings
+        box = layout.box()
+        box.label(text="Image Settings")
+        box.prop(prefs, "image_width")
+        box.prop(prefs, "image_height")
+        box.prop(prefs, "num_inference_steps")
+        box.prop(prefs, "enable_safety_checker")
+        
+        # Prompt inputs
+        layout.prop(prefs, "prompt")
+        layout.prop(prefs, "negative_prompt")
+        
+        # Generate button
+        layout.operator("fal.generate_image", text="Generate Image")
+
+class FAL_OT_GenerateImage(bpy.types.Operator):
+    """Generate image using FAL API"""
+    bl_idname = "fal.generate_image"
+    bl_label = "Generate Image"
+    
+    def execute(self, context):
+        prefs = context.scene.fal_image_prefs
+        
+        if not prefs.save_directory:
+            self.report({'ERROR'}, "Please set a save directory first")
+            return {'CANCELLED'}
+            
+        if not prefs.prompt:
+            self.report({'ERROR'}, "Please enter a prompt")
+            return {'CANCELLED'}
+        
+        # Ensure save directory exists
+        save_dir = Path(prefs.save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Submit request to FAL API
+            request = fal.apps.submit(
+                "fal-ai/hidream-i1-fast",
+                arguments={
+                    "prompt": prefs.prompt,
+                    "image_size": {
+                        "width": prefs.image_width,
+                        "height": prefs.image_height
+                    },
+                    "num_images": 1,
+                    "output_format": "jpeg",
+                    "negative_prompt": prefs.negative_prompt,
+                    "num_inference_steps": prefs.num_inference_steps,
+                    "enable_safety_checker": prefs.enable_safety_checker
+                }
+            )
+            
+            # Monitor progress
+            for event in request.iter_events(logs=True):
+                if isinstance(event, fal.apps.Queued):
+                    self.report({'INFO'}, f"Queued (position: {event.position})")
+                elif isinstance(event, fal.apps.InProgress):
+                    self.report({'INFO'}, "Generating image...")
+            
+            result = request.get()
+            
+            if 'images' in result and len(result['images']) > 0:
+                image_url = result['images'][0]['url']
+                
+                # Download image
+                response = requests.get(image_url)
+                if response.status_code == 200:
+                    # Save image
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    image_path = save_dir / f"fal_image_{timestamp}.jpg"
+                    with open(image_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    # Create image plane in scene
+                    self.create_image_plane(context, str(image_path))
+                    
+                    self.report({'INFO'}, f"Image saved to {image_path}")
+                    return {'FINISHED'}
+                else:
+                    self.report({'ERROR'}, "Failed to download image")
+                    return {'CANCELLED'}
+            
+            self.report({'ERROR'}, "No image in response")
+            return {'CANCELLED'}
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Error generating image: {str(e)}")
+            return {'CANCELLED'}
+    
+    def create_image_plane(self, context, image_path):
+        # Load image as texture
+        img = bpy.data.images.load(image_path)
+        
+        # Create texture
+        tex = bpy.data.textures.new(name="FAL_Image", type='IMAGE')
+        tex.image = img
+        
+        # Create material
+        mat = bpy.data.materials.new(name="FAL_Image_Material")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        nodes.clear()
+        
+        # Create nodes
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.image = img
+        output = nodes.new('ShaderNodeOutputMaterial')
+        
+        # Link nodes
+        mat.node_tree.links.new(tex_node.outputs['Color'], output.inputs['Surface'])
+        
+        # Create plane
+        bpy.ops.mesh.primitive_plane_add(size=2.0)
+        plane = context.active_object
+        
+        # Add material to plane
+        if plane.data.materials:
+            plane.data.materials[0] = mat
+        else:
+            plane.data.materials.append(mat)
+        
+        # Scale plane to match image aspect ratio
+        if img.size[0] > 0 and img.size[1] > 0:
+            ratio = img.size[1] / img.size[0]
+            plane.scale.y = ratio
+
+
 # Register and unregister functions
 def register():
     log_debug("Registering FAL Package Manager addon")
@@ -484,7 +684,7 @@ def register():
         name="FAL API Key",
         description="API Key for FAL service",
         default="",
-        subtype='PASSWORD'  # This hides the text as dots
+        subtype='PASSWORD'
     )
     
     bpy.types.Scene.fal_install_log = bpy.props.StringProperty(
@@ -525,9 +725,14 @@ def register():
         default=""
     )
     
+    # Register new image generation preferences
+    bpy.utils.register_class(FALImageGenPreferences)
+    bpy.types.Scene.fal_image_prefs = bpy.props.PointerProperty(type=FALImageGenPreferences)
+    
     # Register classes
-    for cls in (FALAddonPreferences, FAL_PT_Panel, FAL_OT_InstallPackage, 
-                FAL_OT_UpdateAPIKey, FAL_OT_ViewLog, FAL_OT_ViewDebugLog):
+    for cls in (FALAddonPreferences, FAL_PT_Panel, FAL_OT_InstallPackage,
+                FAL_OT_UpdateAPIKey, FAL_OT_ViewLog, FAL_OT_ViewDebugLog,
+                FAL_PT_ImageGenPanel, FAL_OT_GenerateImage):
         log_debug(f"Registering class: {cls.__name__}")
         bpy.utils.register_class(cls)
     
@@ -538,8 +743,10 @@ def unregister():
     log_debug("Unregistering FAL Package Manager addon")
     
     # Unregister classes
-    for cls in (FAL_OT_ViewDebugLog, FAL_OT_ViewLog, FAL_OT_UpdateAPIKey, 
-                FAL_OT_InstallPackage, FAL_PT_Panel, FALAddonPreferences):
+    for cls in (FAL_OT_GenerateImage, FAL_PT_ImageGenPanel,
+                FAL_OT_ViewDebugLog, FAL_OT_ViewLog, FAL_OT_UpdateAPIKey,
+                FAL_OT_InstallPackage, FAL_PT_Panel, FALAddonPreferences, 
+                FALImageGenPreferences):
         log_debug(f"Unregistering class: {cls.__name__}")
         bpy.utils.unregister_class(cls)
     
@@ -551,10 +758,10 @@ def unregister():
     del bpy.types.Scene.fal_install_in_progress
     del bpy.types.Scene.fal_install_progress
     del bpy.types.Scene.fal_install_pid
+    del bpy.types.Scene.fal_image_prefs
     del bpy.types.Scene.fal_status_message
-    
-    log_debug("FAL Package Manager addon unregistration complete")
 
+    log_debug("FAL Package Manager addon unregistration complete")
 
 if __name__ == "__main__":
     register()
